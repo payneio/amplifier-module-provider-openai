@@ -57,7 +57,7 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
 
 
 class OpenAIProvider:
-    """OpenAI Responses API integration."""
+    """OpenAI Responses API integration with Chat Completions fallback."""
 
     name = "openai"
     api_label = "OpenAI"
@@ -94,9 +94,13 @@ class OpenAIProvider:
 
         # Provider priority for selection (lower = higher priority)
         self.priority = self.config.get("priority", 100)
+        
+        # Auto-detection: which API to use
+        self._use_chat_completions = self.config.get("use_chat_completions", None)  # None = auto-detect
+        self._api_detected = False
 
     async def complete(self, messages: list[dict[str, Any]] | ChatRequest, **kwargs) -> ProviderResponse | ChatResponse:
-        """Generate completion using Responses API.
+        """Generate completion using Responses API with Chat Completions fallback.
 
         Args:
             messages: Conversation history (list of dicts or ChatRequest)
@@ -105,6 +109,58 @@ class OpenAIProvider:
         Returns:
             Provider response or ChatResponse
         """
+        # Auto-detect which API to use on first call
+        if not self._api_detected:
+            await self._detect_api()
+        
+        # Use Chat Completions API if configured or detected
+        if self._use_chat_completions:
+            return await self._complete_with_chat_api(messages, **kwargs)
+        
+        # Try Responses API, fall back to Chat Completions on 404
+        try:
+            return await self._complete_with_responses_api(messages, **kwargs)
+        except Exception as e:
+            # Check if it's a 404 (endpoint not found)
+            if "404" in str(e) or "Not Found" in str(e):
+                logger.info(f"{self.api_label} Responses API not available (404), falling back to Chat Completions API")
+                self._use_chat_completions = True
+                self._api_detected = True
+                return await self._complete_with_chat_api(messages, **kwargs)
+            raise
+    
+    async def _detect_api(self):
+        """Auto-detect which API the server supports."""
+        if self._use_chat_completions is not None:
+            self._api_detected = True
+            return
+        
+        # Try a simple Responses API call to see if it's supported
+        try:
+            test_params = {
+                "model": self.default_model,
+                "input": "USER: test\n\nASSISTANT:",
+                "max_output_tokens": 1,
+            }
+            await asyncio.wait_for(
+                self.client.responses.create(**test_params),
+                timeout=10.0
+            )
+            self._use_chat_completions = False
+            logger.info(f"{self.api_label} Responses API detected and will be used")
+        except Exception as e:
+            if "404" in str(e) or "Not Found" in str(e):
+                self._use_chat_completions = True
+                logger.info(f"{self.api_label} Responses API not available, will use Chat Completions API")
+            else:
+                # Other error, default to Responses API and let it fail properly later
+                self._use_chat_completions = False
+                logger.warning(f"{self.api_label} API detection failed: {e}, defaulting to Responses API")
+        
+        self._api_detected = True
+    
+    async def _complete_with_responses_api(self, messages: list[dict[str, Any]] | ChatRequest, **kwargs) -> ProviderResponse | ChatResponse:
+        """Generate completion using Responses API."""
         # Handle ChatRequest format
         if isinstance(messages, ChatRequest):
             return await self._complete_chat_request(messages, **kwargs)
@@ -1169,6 +1225,108 @@ class OpenAIProvider:
                 }
             )
         return openai_tools
+
+    async def _complete_with_chat_api(self, messages: list[dict[str, Any]] | ChatRequest, **kwargs) -> ProviderResponse | ChatResponse:
+        """Generate completion using Chat Completions API (vLLM compatible).
+        
+        Args:
+            messages: Conversation history (list of dicts or ChatRequest)
+            **kwargs: Additional parameters
+            
+        Returns:
+            Provider response or ChatResponse
+        """
+        # Handle ChatRequest format
+        if isinstance(messages, ChatRequest):
+            chat_messages = []
+            for msg in messages.messages:
+                chat_messages.append({
+                    "role": msg.role,
+                    "content": msg.content if isinstance(msg.content, str) else str(msg.content)
+                })
+            messages = chat_messages
+        
+        # Prepare parameters
+        model = kwargs.get("model", self.default_model)
+        max_tokens = kwargs.get("max_tokens", self.max_tokens)
+        temperature = kwargs.get("temperature", self.temperature)
+        
+        # Emit llm:request event
+        if self.coordinator and hasattr(self.coordinator, "hooks"):
+            await self.coordinator.hooks.emit(
+                "llm:request",
+                {
+                    "provider": self.name,
+                    "model": model,
+                    "message_count": len(messages),
+                    "api": "chat_completions",
+                },
+            )
+        
+        start_time = time.time()
+        
+        try:
+            # Call Chat Completions API
+            response = await self.client.chat.completions.create(
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature if temperature is not None else 0.7,
+                timeout=self.timeout,
+            )
+            
+            elapsed_ms = int((time.time() - start_time) * 1000)
+            
+            # Extract content and usage
+            content = response.choices[0].message.content or ""
+            usage_counts = {
+                "input": response.usage.prompt_tokens if response.usage else 0,
+                "output": response.usage.completion_tokens if response.usage else 0,
+                "total": response.usage.total_tokens if response.usage else 0,
+            }
+            
+            # Emit llm:response event
+            if self.coordinator and hasattr(self.coordinator, "hooks"):
+                await self.coordinator.hooks.emit(
+                    "llm:response",
+                    {
+                        "provider": self.name,
+                        "model": model,
+                        "usage": {"input": usage_counts["input"], "output": usage_counts["output"]},
+                        "status": "ok",
+                        "duration_ms": elapsed_ms,
+                        "api": "chat_completions",
+                    },
+                )
+            
+            # Return standardized response
+            return ProviderResponse(
+                content=content,
+                raw=response,
+                usage=usage_counts,
+                tool_calls=None,
+                content_blocks=[TextContent(text=content, raw=response)] if content else None,
+            )
+            
+        except Exception as e:
+            elapsed_ms = int((time.time() - start_time) * 1000)
+            logger.error("%s Chat Completions API error: %s", self.api_label, e)
+            
+            # Emit llm:response event with error
+            if self.coordinator and hasattr(self.coordinator, "hooks"):
+                await self.coordinator.hooks.emit(
+                    "llm:response",
+                    {
+                        "status": "error",
+                        "duration_ms": elapsed_ms,
+                        "error": str(e),
+                        "provider": self.name,
+                        "model": model,
+                        "api": "chat_completions",
+                    },
+                )
+            
+            raise
 
     def _convert_to_chat_response(self, response: Any) -> ChatResponse:
         """Convert OpenAI response to ChatResponse format.
