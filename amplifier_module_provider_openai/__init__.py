@@ -74,7 +74,7 @@ class OpenAIProvider:
         if client is None:
             if api_key is None:
                 raise ValueError("api_key or client must be provided")
-            self.client = AsyncOpenAI(api_key=api_key)
+            self.client = AsyncOpenAI(api_key=api_key, base_url=config.get("base_url") if config else None)
         else:
             self.client = client
             if api_key is None:
